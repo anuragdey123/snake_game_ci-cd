@@ -1,0 +1,120 @@
+pipeline {
+  agent {
+    kubernetes {
+      yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    agent-label: kaniko-helm-agent
+spec:
+  serviceAccountName: helm-deployer
+  containers:
+  - name: kaniko
+    image: gcr.io/kaniko-project/executor:debug
+    command:
+    - /busybox/sh
+    tty: true
+    volumeMounts:
+    - name: kaniko-secret
+      mountPath: /kaniko/.docker
+  - name: helm
+    image: alpine/helm:3.14.0
+    command:
+    - /bin/sh
+    args:
+    - -c
+    - cat
+    tty: true
+  volumes:
+  - name: kaniko-secret
+    secret:
+      secretName: dockerhub-kaniko-secret
+"""
+      defaultContainer 'helm'
+    }
+  }
+
+  environment {
+    DOCKER_IMAGE = 'anurag927/snake-game'
+    IMAGE_TAG = "${BUILD_NUMBER}"
+    APP_REPO = 'https://github.com/anuragdey123/snake_game-'
+    HELM_REPO = 'https://github.com/anuragdey123/snake-game-helm.git'
+  }
+
+  stages {
+    stage('Clone App Code') {
+      steps {
+        echo "📥 Cloning app code..."
+        git url: "${APP_REPO}", branch: 'main'
+        sh 'ls -la'
+      }
+    }
+
+    stage('Build & Push Image (Kaniko)') {
+      steps {
+        container('kaniko') {
+          echo "🐳 Building image with Kaniko..."
+          sh '''
+            echo "Checking Kaniko configuration..."
+            ls -la /kaniko/.docker/
+            cat /kaniko/.docker/config.json || echo "config.json not found"
+            
+            /kaniko/executor \
+              --dockerfile=./Dockerfile \
+              --context=dir://. \
+              --destination=${DOCKER_IMAGE}:${IMAGE_TAG} \
+              --verbosity=debug
+          '''
+        }
+      }
+    }
+
+    stage('Clone Helm Chart') {
+      steps {
+        container('helm') {
+          echo "📥 Cloning Helm repo..."
+          sh 'git clone ${HELM_REPO}'
+        }
+      }
+    }
+
+    stage('Update Helm values') {
+      steps {
+        container('helm') {
+          echo "🛠️ Updating values.yaml..."
+          sh '''
+            cd snake-game-helm
+            sed -i "s|repository:.*|repository: ${DOCKER_IMAGE}|" values.yaml
+            sed -i "s|tag:.*|tag: \\"${IMAGE_TAG}\\"|" values.yaml
+          '''
+        }
+      }
+    }
+
+    stage('Deploy with Helm') {
+      steps {
+        container('helm') {
+          echo "🚀 Deploying using Helm..."
+          sh '''
+            cd snake-game-helm
+            helm upgrade --install snake-game . --namespace helm-snake --create-namespace
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      echo "🧹 Cleaning workspace..."
+      script {
+        try {
+          cleanWs()
+        } catch (e) {
+          echo "cleanWs plugin missing, skipping cleanup"
+        }
+      }
+    }
+  }
+}
